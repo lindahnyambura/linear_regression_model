@@ -111,8 +111,8 @@ def process_prediction(predicted_price: float) -> float:
     """
     # Set minimum threshold for prices
     MIN_PRICE = 0.01
-    # Set maximum threshold based on historical data analysis
-    MAX_PRICE_USD = 10000.0  # Adjust based on your domain knowledge
+    # Set maximum threshold for prices
+    MAX_PRICE_USD = 500.0 
     
     # Clip prediction between min and max values
     processed_price = np.clip(predicted_price, MIN_PRICE, MAX_PRICE_USD)
