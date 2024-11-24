@@ -9,9 +9,9 @@ import math
 import os
 from typing import List
 
-# Load the pre-trained Random Forest model
+# Load the pre-trained Linear Regression model
 current_dir = os.path.dirname(__file__)
-model_path = os.path.join(current_dir, "random_forest_model.joblib")
+model_path = os.path.join(current_dir, "linear_regression_model.joblib")
 model = joblib.load(model_path)
 
 app = FastAPI(
@@ -53,18 +53,6 @@ class PredictionRequest(BaseModel):
             raise ValueError('Currency must be either KES or USD')
         return v
 
-    @field_validator('rolling_avg_price')
-    def validate_rolling_avg(cls, v):
-        if v < 0:
-            raise ValueError('Rolling average price cannot be negative')
-        return v
-
-    @field_validator('price_volatility')
-    def validate_volatility(cls, v):
-        if v < 0:
-            raise ValueError('Price volatility cannot be negative')
-        return v
-
 def preprocess_input(data: PredictionRequest):
     try:
         date_obj = datetime.strptime(data.date, "%Y-%m-%d")
@@ -99,41 +87,33 @@ def preprocess_input(data: PredictionRequest):
             int(data.currency == "USD")
         ]
 
-        #load the scaler
         scaler_path = os.path.join(current_dir, "scaler.pkl")
         if not os.path.exists(scaler_path):
             raise FileNotFoundError("Scaler file not found")
 
         scaler = joblib.load(scaler_path)
-
-        #scale the input features
         scaled_features = scaler.transform([input_features])
         return scaled_features
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
             detail={"message": "Preprocessing error", "error": str(e)}
         )
 
-def post_process_prediction(predicted_price: float, confidence_interval: dict = None) -> tuple:
+def process_prediction(predicted_price: float) -> float:
     """
-    Post-process the prediction to ensure non-negative prices and adjust confidence intervals
+    Process the prediction to ensure reasonable price values
     """
-    # Apply a minimum threshold (e.g., 0.01) for prices
-    processed_price = max(0.01, predicted_price)
+    # Set minimum threshold for prices
+    MIN_PRICE = 0.01
+    # Set maximum threshold based on historical data analysis
+    MAX_PRICE_USD = 10000.0  # Adjust based on your domain knowledge
     
-    if confidence_interval:
-        processed_ci = {
-            "lower_bound": max(0.01, confidence_interval["lower_bound"]),
-            "upper_bound": max(0.01, confidence_interval["upper_bound"])
-        }
-        # Ensure lower bound doesn't exceed upper bound
-        if processed_ci["lower_bound"] > processed_ci["upper_bound"]:
-            processed_ci["lower_bound"] = processed_ci["upper_bound"]
-    else:
-        processed_ci = None
-        
-    return processed_price, processed_ci
+    # Clip prediction between min and max values
+    processed_price = np.clip(predicted_price, MIN_PRICE, MAX_PRICE_USD)
+    
+    return float(processed_price)
 
 @app.post('/predict', response_model=dict)
 async def predict(data: PredictionRequest):
@@ -141,52 +121,37 @@ async def predict(data: PredictionRequest):
         preprocessed_data = preprocess_input(data)
         predicted_price_usd = float(model.predict(preprocessed_data)[0])
         
-        # Calculate confidence intervals
-        if hasattr(model, 'estimators_'):
-            tree_predictions = [tree.predict(preprocessed_data)[0] for tree in model.estimators_]
-            confidence_interval_usd = {
-                "lower_bound": float(np.percentile(tree_predictions, 25)),
-                "upper_bound": float(np.percentile(tree_predictions, 75))
-            }
-        else:
-            confidence_interval_usd = None
-
-        # Post-process USD predictions
-        processed_price_usd, processed_ci_usd = post_process_prediction(
-            predicted_price_usd, 
-            confidence_interval_usd
-        )
+        # Process USD prediction
+        processed_price_usd = process_prediction(predicted_price_usd)
         
-        # Convert to KES and post-process
+        # Convert to KES
         predicted_price_kes = processed_price_usd * data.price_to_usd_ratio
-        confidence_interval_kes = None
-        if processed_ci_usd:
-            confidence_interval_kes = {
-                "lower_bound": processed_ci_usd["lower_bound"] * data.price_to_usd_ratio,
-                "upper_bound": processed_ci_usd["upper_bound"] * data.price_to_usd_ratio
-            }
 
-        # Add warning if original prediction was negative
-        warnings = []
-        if predicted_price_usd < 0:
-            warnings.append("Original prediction was negative and was adjusted to ensure non-negative prices")
+        # Calculate percentage difference from rolling average
+        price_diff_percent = ((processed_price_usd - data.rolling_avg_price) / 
+                            data.rolling_avg_price * 100 if data.rolling_avg_price > 0 else 0)
+
+        # Add price trend analysis
+        price_trend = "stable"
+        if abs(price_diff_percent) > 20:  # Threshold for significant change
+            price_trend = "increasing" if price_diff_percent > 0 else "decreasing"
 
         return {
             "status": "success",
             "predictions": {
                 "usd": {
-                    "price": round(processed_price_usd, 2),
-                    "confidence_interval": processed_ci_usd
+                    "price": round(processed_price_usd, 2)
                 },
                 "kes": {
-                    "price": round(predicted_price_kes, 2),
-                    "confidence_interval": confidence_interval_kes
+                    "price": round(predicted_price_kes, 2)
                 }
             },
             "analysis": {
                 "current_rolling_average": float(data.rolling_avg_price),
                 "price_volatility": float(data.price_volatility),
-                "price_to_usd_ratio": float(data.price_to_usd_ratio)
+                "price_to_usd_ratio": float(data.price_to_usd_ratio),
+                "price_trend": price_trend,
+                "price_difference_percent": round(price_diff_percent, 2)
             },
             "metadata": {
                 "prediction_date": data.date,
@@ -196,8 +161,7 @@ async def predict(data: PredictionRequest):
                     "cluster": data.location_cluster
                 },
                 "price_type": data.pricetype
-            },
-            "warnings": warnings if warnings else None
+            }
         }
     
     except ValueError as ve:
